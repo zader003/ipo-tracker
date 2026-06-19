@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 
 export const config = { runtime: 'edge' };
 
-const KEYWORDS = ['emission', 'ipo', 'nyemission', 'företrädesemission', 'listning'];
+const KEYWORDS = ['emission', 'nyemission', 'företrädesemission', 'rights issue', 'subsequent offering', 'private placement', 'kapitalforhøjelse', 'rettet emission'];
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -52,72 +52,56 @@ export default async function handler(req) {
   const headers = { 'Content-Type': 'application/json' };
 
   try {
-    // Hämta RSS från mfn.se
-    const rssResponse = await fetch('https://mfn.se/all/s/rss', {
-      headers: { 'User-Agent': 'IPO-Akuten/1.0' }
+    const mfnResponse = await fetch('https://www.mfn.se/all/s/nordic', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IPO-Akuten/1.0)' }
     });
 
-    if (!rssResponse.ok) {
-      return new Response(JSON.stringify({ error: 'Kunde inte hämta mfn.se RSS' }), { status: 502, headers });
+    if (!mfnResponse.ok) {
+      return new Response(JSON.stringify({ error: 'Kunde inte hämta mfn.se' }), { status: 502, headers });
     }
 
-    const rssText = await rssResponse.text();
+    const html = await mfnResponse.text();
 
-    // Plocka ut items från RSS
+    // Matcha mönster: datum, bolagslänk, titellänk
+    const itemRegex = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\[([^\]]+)\]\(https:\/\/www\.mfn\.se\/all\/a\/[^\)]+\)\s*\[([^\]]+)\]\(([^"]+?)\s*"[^"]*"\)/g;
+
     const items = [];
-    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
     let match;
-    while ((match = itemRegex.exec(rssText)) !== null) {
-      const item = match[1];
-      const title = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || item.match(/<title>(.*?)<\/title>/))?.[1] ?? '';
-      const description = (item.match(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/) || item.match(/<description>([\s\S]*?)<\/description>/))?.[1] ?? '';
-      const link = item.match(/<link>(.*?)<\/link>/)?.[1] ?? '';
-      const guid = item.match(/<guid[^>]*>(.*?)<\/guid>/)?.[1] ?? link;
-
-      // Kolla om titeln innehåller emissionsrelaterade ord
+    while ((match = itemRegex.exec(html)) !== null) {
+      const [, date, company, title, link] = match;
       const titleLower = title.toLowerCase();
       const isEmission = KEYWORDS.some(kw => titleLower.includes(kw));
-      if (!isEmission) continue;
-
-      items.push({ title, description, link, guid });
+      if (isEmission) {
+        items.push({ date, company: company.trim(), title: title.trim(), link: link.trim() });
+      }
     }
 
     if (items.length === 0) {
-      return new Response(JSON.stringify({ message: 'Inga nya emissioner hittades', checked: 0 }), { status: 200, headers });
+      return new Response(JSON.stringify({ message: 'Inga nya emissioner hittades just nu', checked: 0 }), { status: 200, headers });
     }
 
     let added = 0;
     let skipped = 0;
 
-    for (const item of items.slice(0, 5)) { // Max 5 per körning
-      // Dublettkoll via mfn_id
+    for (const item of items.slice(0, 3)) {
       const { data: existing } = await supabase
         .from('emissions')
         .select('id')
-        .eq('mfn_id', item.guid)
+        .eq('mfn_id', item.link)
         .single();
 
       if (existing) { skipped++; continue; }
 
-      // Extrahera bolagsnamn från titel (första ordet/frasen)
-      const companyName = item.title.split(/\s+(genomför|offentliggör|meddelar|planerar|ansöker)/i)[0].trim();
-
-      // AI-analys
-      const fullText = `${item.title}\n\n${item.description}`;
-      const aiResult = await analyzeWithAI(fullText);
-      if (!aiResult) { skipped++; continue; }
-
-      // Spara bolag
       let { data: company } = await supabase
         .from('companies')
         .select('id')
-        .eq('name', companyName)
+        .eq('name', item.company)
         .single();
 
       if (!company) {
         const { data: newCompany } = await supabase
           .from('companies')
-          .insert([{ name: companyName, ticker: null, sector: null }])
+          .insert([{ name: item.company, ticker: null, sector: null }])
           .select('id')
           .single();
         company = newCompany;
@@ -125,24 +109,25 @@ export default async function handler(req) {
 
       if (!company) { skipped++; continue; }
 
-      // Spara emission
+      const aiResult = await analyzeWithAI(item.title);
+      if (!aiResult) { skipped++; continue; }
+
       const { data: emission } = await supabase
         .from('emissions')
         .insert([{
           company_id: company.id,
-          type: item.title.toLowerCase().includes('ipo') || item.title.toLowerCase().includes('listning') ? 'IPO' : 'Företrädesemission',
+          type: 'Företrädesemission',
           status: 'active',
           source_url: item.link,
           avanza_url: 'https://www.avanza.se',
           nordnet_url: 'https://www.nordnet.se',
-          mfn_id: item.guid,
+          mfn_id: item.link,
         }])
         .select('id')
         .single();
 
       if (!emission) { skipped++; continue; }
 
-      // Spara AI-analys
       await supabase.from('ai_analyses').insert([{
         emission_id: emission.id,
         short_summary: aiResult.short_summary,
@@ -166,6 +151,7 @@ export default async function handler(req) {
 
     return new Response(JSON.stringify({
       message: `Klar! ${added} nya emissioner tillagda, ${skipped} hoppades över.`,
+      found: items.length,
       added,
       skipped
     }), { status: 200, headers });
@@ -174,4 +160,3 @@ export default async function handler(req) {
     return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
   }
 }
-
